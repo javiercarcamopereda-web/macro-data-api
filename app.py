@@ -1,10 +1,11 @@
 from fastapi import FastAPI, Query, HTTPException
 import requests
 import os
+import time
 from datetime import datetime, timezone, timedelta
 from dateutil.relativedelta import relativedelta
 
-app = FastAPI(title="Macro Data API", version="3.0.0")
+app = FastAPI(title="Macro Data API", version="3.1.0")
 
 FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
 
@@ -24,6 +25,16 @@ SERIES_MAP = {
     "dxy": "DTWEXBGS",
     "hy_spreads": "BAMLH0A0HYM2",
 }
+
+# -------- CONFIG --------
+REQUEST_DELAY_SECONDS = 0.55   # <= ~2 req/s
+CACHE_TTL_SECONDS = 900        # 15 min
+MAX_RETRIES = 4
+BACKOFF_BASE = 1.5
+
+# cache simple en memoria
+CACHE = {}
+LAST_REQUEST_TS = 0.0
 
 
 def get_fred_api_key():
@@ -47,25 +58,74 @@ def safe_round(value, digits=4):
     return round(value, digits)
 
 
-def fred_latest_before(series_id: str, end_date: str):
-    api_key = get_fred_api_key()
+def rate_limit_sleep():
+    global LAST_REQUEST_TS
+    elapsed = time.time() - LAST_REQUEST_TS
+    if elapsed < REQUEST_DELAY_SECONDS:
+        time.sleep(REQUEST_DELAY_SECONDS - elapsed)
+    LAST_REQUEST_TS = time.time()
 
+
+def cache_get(key):
+    item = CACHE.get(key)
+    if not item:
+        return None
+    if time.time() - item["ts"] > CACHE_TTL_SECONDS:
+        del CACHE[key]
+        return None
+    return item["value"]
+
+
+def cache_set(key, value):
+    CACHE[key] = {"ts": time.time(), "value": value}
+
+
+def fred_request(params: dict):
+    api_key = get_fred_api_key()
+    params = {**params, "api_key": api_key, "file_type": "json"}
+
+    cache_key = tuple(sorted(params.items()))
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    last_error = None
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            rate_limit_sleep()
+            r = requests.get(FRED_BASE, params=params, timeout=30)
+
+            if r.status_code == 429:
+                wait = BACKOFF_BASE ** attempt
+                time.sleep(wait)
+                last_error = f"429 Too Many Requests, retry {attempt + 1}/{MAX_RETRIES}"
+                continue
+
+            r.raise_for_status()
+            data = r.json()
+            cache_set(cache_key, data)
+            return data
+
+        except requests.RequestException as e:
+            last_error = str(e)
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(BACKOFF_BASE ** attempt)
+            else:
+                raise HTTPException(status_code=502, detail=f"FRED request failed: {last_error}")
+
+    raise HTTPException(status_code=502, detail=f"FRED request failed: {last_error}")
+
+
+def fred_latest_before(series_id: str, end_date: str):
     params = {
         "series_id": series_id,
-        "api_key": api_key,
-        "file_type": "json",
         "sort_order": "desc",
         "limit": 20,
         "observation_end": end_date,
     }
 
-    try:
-        r = requests.get(FRED_BASE, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"FRED request failed: {e}")
-
+    data = fred_request(params)
     observations = data.get("observations", [])
 
     for obs in observations:
@@ -169,16 +229,10 @@ def build_curve_comparison(us10y_comp: dict, us2y_comp: dict):
         us2 = us2y_comp.get(key, {}).get("value")
         date = us10y_comp.get(key, {}).get("date")
 
-        if us10 is not None and us2 is not None:
-            curve[key] = {
-                "date": date,
-                "value": safe_round(us10 - us2)
-            }
-        else:
-            curve[key] = {
-                "date": date,
-                "value": None
-            }
+        curve[key] = {
+            "date": date,
+            "value": safe_round(us10 - us2) if us10 is not None and us2 is not None else None
+        }
 
     curve["changes"] = calculate_changes(curve)
     return curve
@@ -262,10 +316,9 @@ def snapshot_core():
         elif field in snapshot["sentimiento_mercado"]:
             snapshot["sentimiento_mercado"][field] = value
 
-        if date:
-            snapshot["notas_calidad"].append(f"{field}: ultimo dato disponible {date}")
-        else:
-            snapshot["notas_calidad"].append(f"{field}: sin dato disponible")
+        snapshot["notas_calidad"].append(
+            f"{field}: ultimo dato disponible {date}" if date else f"{field}: sin dato disponible"
+        )
 
     snapshot["inflacion"]["cpi_yoy"] = yoy_from_series("CPIAUCSL")
     snapshot["inflacion"]["pce_yoy"] = yoy_from_series("PCEPI")
@@ -297,16 +350,16 @@ def snapshot_core_compare():
             snapshot["sentimiento_mercado"][field] = comparison_data
 
         current_date = comparison_data.get("current", {}).get("date")
-        if current_date:
-            snapshot["notas_calidad"].append(f"{field}: current usa dato {current_date}")
-        else:
-            snapshot["notas_calidad"].append(f"{field}: sin dato disponible")
+        snapshot["notas_calidad"].append(
+            f"{field}: current usa dato {current_date}" if current_date else f"{field}: sin dato disponible"
+        )
 
     snapshot["inflacion"]["cpi_yoy"] = yoy_from_series("CPIAUCSL")
     snapshot["inflacion"]["pce_yoy"] = yoy_from_series("PCEPI")
 
-    us2y_comp = snapshot["bonos"]["us2y"]
-    us10y_comp = snapshot["bonos"]["us10y"]
-    snapshot["bonos"]["curve_2s10s"] = build_curve_comparison(us10y_comp, us2y_comp)
+    snapshot["bonos"]["curve_2s10s"] = build_curve_comparison(
+        snapshot["bonos"]["us10y"],
+        snapshot["bonos"]["us2y"]
+    )
 
     return snapshot

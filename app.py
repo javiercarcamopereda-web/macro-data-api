@@ -4,9 +4,8 @@ import os
 from datetime import datetime, timezone, timedelta
 from dateutil.relativedelta import relativedelta
 
-app = FastAPI(title="Macro Data API", version="2.0.0")
+app = FastAPI(title="Macro Data API", version="3.0.0")
 
-FRED_API_KEY = os.getenv("FRED_API_KEY")
 FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
 
 SERIES_MAP = {
@@ -26,19 +25,34 @@ SERIES_MAP = {
     "hy_spreads": "BAMLH0A0HYM2",
 }
 
+
+def get_fred_api_key():
+    api_key = os.getenv("FRED_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="FRED_API_KEY not configured")
+    return api_key
+
+
 def now_utc():
     return datetime.now(timezone.utc)
+
 
 def fmt_date(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d")
 
+
+def safe_round(value, digits=4):
+    if value is None:
+        return None
+    return round(value, digits)
+
+
 def fred_latest_before(series_id: str, end_date: str):
-    if not FRED_API_KEY:
-        raise HTTPException(status_code=500, detail="FRED_API_KEY not configured")
+    api_key = get_fred_api_key()
 
     params = {
         "series_id": series_id,
-        "api_key": FRED_API_KEY,
+        "api_key": api_key,
         "file_type": "json",
         "sort_order": "desc",
         "limit": 20,
@@ -70,6 +84,7 @@ def fred_latest_before(series_id: str, end_date: str):
 
     return {"date": None, "value": None}
 
+
 def get_comparison_dates():
     now = now_utc()
     return {
@@ -79,6 +94,31 @@ def get_comparison_dates():
         "1m_ago": fmt_date(now - relativedelta(months=1)),
         "3m_ago": fmt_date(now - relativedelta(months=3)),
     }
+
+
+def calculate_changes(comparison_data: dict):
+    current = comparison_data.get("current", {}).get("value")
+
+    def safe_change(reference_key: str):
+        ref = comparison_data.get(reference_key, {}).get("value")
+        if current is None or ref is None:
+            return {"abs": None, "pct": None}
+
+        abs_change = current - ref
+        pct_change = None if ref == 0 else (abs_change / ref) * 100
+
+        return {
+            "abs": safe_round(abs_change),
+            "pct": safe_round(pct_change)
+        }
+
+    return {
+        "vs_1d": safe_change("1d_ago"),
+        "vs_7d": safe_change("7d_ago"),
+        "vs_1m": safe_change("1m_ago"),
+        "vs_3m": safe_change("3m_ago"),
+    }
+
 
 def build_series_comparison(series_id: str):
     comparison_dates = get_comparison_dates()
@@ -91,7 +131,58 @@ def build_series_comparison(series_id: str):
             "value": item["value"]
         }
 
+    result["changes"] = calculate_changes(result)
     return result
+
+
+def yoy_from_series(series_id: str):
+    current_date = fmt_date(now_utc())
+    prev_year_date = fmt_date(now_utc() - relativedelta(months=12))
+
+    current_item = fred_latest_before(series_id, current_date)
+    prev_year_item = fred_latest_before(series_id, prev_year_date)
+
+    current_value = current_item.get("value")
+    prev_year_value = prev_year_item.get("value")
+
+    if current_value is None or prev_year_value is None or prev_year_value == 0:
+        return {
+            "current": {"date": current_item.get("date"), "value": current_value},
+            "12m_ago": {"date": prev_year_item.get("date"), "value": prev_year_value},
+            "yoy_pct": None
+        }
+
+    yoy_pct = ((current_value / prev_year_value) - 1) * 100
+
+    return {
+        "current": {"date": current_item.get("date"), "value": current_value},
+        "12m_ago": {"date": prev_year_item.get("date"), "value": prev_year_value},
+        "yoy_pct": safe_round(yoy_pct)
+    }
+
+
+def build_curve_comparison(us10y_comp: dict, us2y_comp: dict):
+    curve = {}
+
+    for key in ["current", "1d_ago", "7d_ago", "1m_ago", "3m_ago"]:
+        us10 = us10y_comp.get(key, {}).get("value")
+        us2 = us2y_comp.get(key, {}).get("value")
+        date = us10y_comp.get(key, {}).get("date")
+
+        if us10 is not None and us2 is not None:
+            curve[key] = {
+                "date": date,
+                "value": safe_round(us10 - us2)
+            }
+        else:
+            curve[key] = {
+                "date": date,
+                "value": None
+            }
+
+    curve["changes"] = calculate_changes(curve)
+    return curve
+
 
 def build_empty_core_snapshot():
     return {
@@ -104,7 +195,9 @@ def build_empty_core_snapshot():
         },
         "inflacion": {
             "cpi": None,
+            "cpi_yoy": None,
             "pce": None,
+            "pce_yoy": None,
             "breakeven_10y": None
         },
         "activos_termometro": {
@@ -125,13 +218,16 @@ def build_empty_core_snapshot():
         "notas_calidad": []
     }
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
 
+
 @app.get("/fred/series/observations")
 def get_series_observations(series_id: str = Query(...)):
     return fred_latest_before(series_id, fmt_date(now_utc()))
+
 
 @app.get("/series/compare")
 def series_compare(series_key: str):
@@ -144,6 +240,7 @@ def series_compare(series_key: str):
         "series_id": series_id,
         "comparisons": build_series_comparison(series_id)
     }
+
 
 @app.get("/snapshot/core")
 def snapshot_core():
@@ -170,12 +267,16 @@ def snapshot_core():
         else:
             snapshot["notas_calidad"].append(f"{field}: sin dato disponible")
 
+    snapshot["inflacion"]["cpi_yoy"] = yoy_from_series("CPIAUCSL")
+    snapshot["inflacion"]["pce_yoy"] = yoy_from_series("PCEPI")
+
     us2y = snapshot["bonos"]["us2y"]
     us10y = snapshot["bonos"]["us10y"]
     if us2y is not None and us10y is not None:
-        snapshot["bonos"]["curve_2s10s"] = us10y - us2y
+        snapshot["bonos"]["curve_2s10s"] = safe_round(us10y - us2y)
 
     return snapshot
+
 
 @app.get("/snapshot/core_compare")
 def snapshot_core_compare():
@@ -195,15 +296,17 @@ def snapshot_core_compare():
         elif field in snapshot["sentimiento_mercado"]:
             snapshot["sentimiento_mercado"][field] = comparison_data
 
-    us2y_current = snapshot["bonos"]["us2y"]["current"]["value"]
-    us10y_current = snapshot["bonos"]["us10y"]["current"]["value"]
+        current_date = comparison_data.get("current", {}).get("date")
+        if current_date:
+            snapshot["notas_calidad"].append(f"{field}: current usa dato {current_date}")
+        else:
+            snapshot["notas_calidad"].append(f"{field}: sin dato disponible")
 
-    if us2y_current is not None and us10y_current is not None:
-        snapshot["bonos"]["curve_2s10s"] = {
-            "current": {
-                "date": snapshot["bonos"]["us10y"]["current"]["date"],
-                "value": us10y_current - us2y_current
-            }
-        }
+    snapshot["inflacion"]["cpi_yoy"] = yoy_from_series("CPIAUCSL")
+    snapshot["inflacion"]["pce_yoy"] = yoy_from_series("PCEPI")
+
+    us2y_comp = snapshot["bonos"]["us2y"]
+    us10y_comp = snapshot["bonos"]["us10y"]
+    snapshot["bonos"]["curve_2s10s"] = build_curve_comparison(us10y_comp, us2y_comp)
 
     return snapshot

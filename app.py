@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from dateutil.relativedelta import relativedelta
 from providers.crypto import get_crypto_snapshot
 from providers.market import get_market_snapshot
-from providers.options import get_option_chain, summarize_option_chain
+from providers.options import get_option_chain_snapshot, summarize_option_chain
 
 from providers.treasury import treasury_get, treasury_latest_mts_table_1_before
 from providers.bls import bls_get_series, bls_latest_valid_before
@@ -565,8 +565,8 @@ def test_market():
     return get_market_snapshot()
 
 @app.get("/options/chain_summary")
-def options_chain_summary(symbol: str, expiration: str):
-    raw = get_option_chain(symbol, expiration)
+def options_chain_summary(symbol: str):
+    raw = get_option_chain_snapshot(symbol)
     return summarize_option_chain(raw)
 
 

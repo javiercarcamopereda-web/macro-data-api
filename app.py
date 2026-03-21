@@ -452,9 +452,9 @@ def snapshot_core():
     snapshot["activos_termometro"]["usdjpy"] = market_data["usdjpy"]
         # ejemplo SPY; luego podrás parametrizarlo
     try:
-        options_data = summarize_option_chain(get_option_chain("SPY", "2026-04-17"))
+        options_data = summarize_option_chain(get_option_chain_snapshot("SPY"))
         snapshot["opciones_mercado"]["symbol"] = "SPY"
-        snapshot["opciones_mercado"]["expiration"] = "2026-04-17"
+        snapshot["opciones_mercado"]["expiration"] = "chain_snapshot"
         snapshot["opciones_mercado"]["total_call_open_interest"] = options_data["total_call_open_interest"]
         snapshot["opciones_mercado"]["total_put_open_interest"] = options_data["total_put_open_interest"]
         snapshot["opciones_mercado"]["put_call_oi_ratio"] = options_data["put_call_oi_ratio"]
@@ -515,7 +515,29 @@ def snapshot_core_compare():
         snapshot["bonos"]["us10y"],
         snapshot["bonos"]["us2y"]
     )
-
+    
+    try:
+        options_data = summarize_option_chain(get_option_chain_snapshot("SPY"))
+        snapshot["opciones_mercado"]["symbol"] = "SPY"
+        snapshot["opciones_mercado"]["expiration"] = "chain_snapshot"
+        snapshot["opciones_mercado"]["total_call_open_interest"] = {
+            "current": {"date": fmt_date(now_utc()), "value": options_data["total_call_open_interest"]}
+        }
+        snapshot["opciones_mercado"]["total_put_open_interest"] = {
+            "current": {"date": fmt_date(now_utc()), "value": options_data["total_put_open_interest"]}
+        }
+        snapshot["opciones_mercado"]["put_call_oi_ratio"] = {
+            "current": {"date": fmt_date(now_utc()), "value": options_data["put_call_oi_ratio"]}
+        }
+        snapshot["opciones_mercado"]["total_call_volume"] = {
+            "current": {"date": fmt_date(now_utc()), "value": options_data["total_call_volume"]}
+        }
+        snapshot["opciones_mercado"]["total_put_volume"] = {
+            "current": {"date": fmt_date(now_utc()), "value": options_data["total_put_volume"]}
+        }
+    except Exception as e:
+        snapshot["notas_calidad"].append(f"options data unavailable: {e}")
+        
     return snapshot
 
 

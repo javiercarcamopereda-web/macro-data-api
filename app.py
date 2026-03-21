@@ -4,7 +4,7 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 from dateutil.relativedelta import relativedelta
-from providers.treasury import treasury_get
+from providers.treasury import treasury_get, treasury_latest_mts_table_1_before
 from providers.bls import bls_get_series
 
 app = FastAPI(title="Macro Data API", version="3.1.0")
@@ -372,6 +372,26 @@ def test_treasury():
         "v1/accounting/mts/mts_table_1",
         {"page[size]": 1, "sort": "-record_date"}
     )
+
+def build_treasury_comparison():
+    comparison_dates = get_comparison_dates()
+
+    def build_field(field_name: str):
+        result = {}
+        for label, end_date in comparison_dates.items():
+            item = treasury_latest_mts_table_1_before(end_date)
+            result[label] = {
+                "date": item["date"],
+                "value": item[field_name]
+            }
+        result["changes"] = calculate_changes(result)
+        return result
+
+    return {
+        "fiscal_receipts": build_field("fiscal_receipts"),
+        "public_spending_proxy": build_field("public_spending_proxy"),
+        "deficit_proxy": build_field("deficit_proxy")
+    }
 
 @app.get("/test/bls")
 def test_bls():

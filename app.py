@@ -366,7 +366,7 @@ def snapshot_core_compare():
     
     return snapshot
     
-    @app.get("/test/treasury")
+@app.get("/test/treasury")
 def test_treasury():
     return treasury_get(
         "v2/accounting/mts/mts_table_1",

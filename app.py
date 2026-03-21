@@ -4,6 +4,9 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 from dateutil.relativedelta import relativedelta
+from providers.crypto import get_crypto_snapshot
+from providers.market import get_market_snapshot
+from providers.options import get_option_chain, summarize_option_chain
 
 from providers.treasury import treasury_get, treasury_latest_mts_table_1_before
 from providers.bls import bls_get_series, bls_latest_valid_before
@@ -331,7 +334,13 @@ def build_empty_core_snapshot():
         },
         "activos_termometro": {
             "sp500": None,
-            "dxy": None
+            "nasdaq": None,
+            "bitcoin": None,
+            "ethereum": None,
+            "gold": None,
+            "dxy": None,
+            "usdjpy": None,
+            "oil": None
         },
         "bonos": {
             "us2y": None,
@@ -343,6 +352,15 @@ def build_empty_core_snapshot():
         },
         "sentimiento_mercado": {
             "vix": None
+        },
+        "opciones_mercado": {
+            "symbol": None,
+            "expiration": None,
+            "total_call_open_interest": None,
+            "total_put_open_interest": None,
+            "put_call_oi_ratio": None,
+            "total_call_volume": None,
+            "total_put_volume": None
         },
         "notas_calidad": []
     }
@@ -422,7 +440,30 @@ def snapshot_core():
     us10y = snapshot["bonos"]["us10y"]
     if us2y is not None and us10y is not None:
         snapshot["bonos"]["curve_2s10s"] = safe_round(us10y - us2y)
+        
+    crypto_data = get_crypto_snapshot()
+    market_data = get_market_snapshot()
 
+    snapshot["activos_termometro"]["bitcoin"] = crypto_data["bitcoin"]
+    snapshot["activos_termometro"]["ethereum"] = crypto_data["ethereum"]
+    snapshot["activos_termometro"]["nasdaq"] = market_data["nasdaq"]
+    snapshot["activos_termometro"]["gold"] = market_data["gold"]
+    snapshot["activos_termometro"]["oil"] = market_data["oil"]
+    snapshot["activos_termometro"]["usdjpy"] = market_data["usdjpy"]
+        # ejemplo SPY; luego podrás parametrizarlo
+    try:
+        options_data = summarize_option_chain(get_option_chain("SPY", "2026-04-17"))
+        snapshot["opciones_mercado"]["symbol"] = "SPY"
+        snapshot["opciones_mercado"]["expiration"] = "2026-04-17"
+        snapshot["opciones_mercado"]["total_call_open_interest"] = options_data["total_call_open_interest"]
+        snapshot["opciones_mercado"]["total_put_open_interest"] = options_data["total_put_open_interest"]
+        snapshot["opciones_mercado"]["put_call_oi_ratio"] = options_data["put_call_oi_ratio"]
+        snapshot["opciones_mercado"]["total_call_volume"] = options_data["total_call_volume"]
+        snapshot["opciones_mercado"]["total_put_volume"] = options_data["total_put_volume"]
+    except Exception as e:
+        snapshot["notas_calidad"].append(f"options data unavailable: {e}")
+
+    
     return snapshot
 
 
@@ -514,3 +555,19 @@ def test_bls_latest_cpi():
 @app.get("/test/bls_compare")
 def test_bls_compare():
     return build_bls_comparison("CUUR0000SA0")
+
+@app.get("/test/crypto")
+def test_crypto():
+    return get_crypto_snapshot()
+
+@app.get("/test/market")
+def test_market():
+    return get_market_snapshot()
+
+@app.get("/options/chain_summary")
+def options_chain_summary(symbol: str, expiration: str):
+    raw = get_option_chain(symbol, expiration)
+    return summarize_option_chain(raw)
+
+
+

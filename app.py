@@ -369,7 +369,7 @@ def snapshot_core_compare():
 @app.get("/test/treasury")
 def test_treasury():
     return treasury_get(
-        "v2/accounting/mts/mts_table_1",
+        "v1/accounting/mts/mts_table_1",
         {"page[size]": 1, "sort": "-record_date"}
     )
 

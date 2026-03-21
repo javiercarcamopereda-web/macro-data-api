@@ -12,7 +12,6 @@ def treasury_get(path: str, params: dict | None = None):
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Treasury request failed: {e}")
 
-
 def treasury_latest_mts_table_1_before(end_date: str):
     data = treasury_get(
         "v1/accounting/mts/mts_table_1",

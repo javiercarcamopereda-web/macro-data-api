@@ -4,6 +4,8 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 from dateutil.relativedelta import relativedelta
+from providers.treasury import treasury_get
+from providers.bls import bls_get_series
 
 app = FastAPI(title="Macro Data API", version="3.1.0")
 
@@ -361,5 +363,20 @@ def snapshot_core_compare():
         snapshot["bonos"]["us10y"],
         snapshot["bonos"]["us2y"]
     )
-
+    
     return snapshot
+    
+    @app.get("/test/treasury")
+def test_treasury():
+    return treasury_get(
+        "v2/accounting/mts/mts_table_1",
+        {"page[size]": 1, "sort": "-record_date"}
+    )
+
+@app.get("/test/bls")
+def test_bls():
+    return bls_get_series(
+        ["CUUR0000SA0"],
+        start_year="2025",
+        end_year="2026"
+    )

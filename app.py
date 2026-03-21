@@ -4,10 +4,11 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 from dateutil.relativedelta import relativedelta
-from providers.treasury import treasury_get, treasury_latest_mts_table_1_before
-from providers.bls import bls_get_series
 
-app = FastAPI(title="Macro Data API", version="3.1.0")
+from providers.treasury import treasury_get, treasury_latest_mts_table_1_before
+from providers.bls import bls_get_series, bls_latest_valid_before
+
+app = FastAPI(title="Macro Data API", version="4.0.0")
 
 FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
 
@@ -20,7 +21,6 @@ SERIES_MAP = {
     "us30y": "DGS30",
     "real_yields_10y": "DFII10",
     "breakeven_10y": "T10YIE",
-    "cpi": "CPIAUCSL",
     "pce": "PCEPI",
     "sp500": "SP500",
     "vix": "VIXCLS",
@@ -29,12 +29,11 @@ SERIES_MAP = {
 }
 
 # -------- CONFIG --------
-REQUEST_DELAY_SECONDS = 0.55   # <= ~2 req/s
-CACHE_TTL_SECONDS = 900        # 15 min
+REQUEST_DELAY_SECONDS = 0.55
+CACHE_TTL_SECONDS = 900
 MAX_RETRIES = 4
 BACKOFF_BASE = 1.5
 
-# cache simple en memoria
 CACHE = {}
 LAST_REQUEST_TS = 0.0
 
@@ -58,6 +57,11 @@ def safe_round(value, digits=4):
     if value is None:
         return None
     return round(value, digits)
+
+
+def to_year_month(date_str: str):
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    return str(dt.year), dt.month
 
 
 def rate_limit_sleep():
@@ -86,7 +90,7 @@ def fred_request(params: dict):
     api_key = get_fred_api_key()
     params = {**params, "api_key": api_key, "file_type": "json"}
 
-    cache_key = tuple(sorted(params.items()))
+    cache_key = ("fred", tuple(sorted(params.items())))
     cached = cache_get(cache_key)
     if cached is not None:
         return cached
@@ -223,6 +227,35 @@ def yoy_from_series(series_id: str):
     }
 
 
+def yoy_from_bls(series_id: str):
+    current_date = fmt_date(now_utc())
+    prev_year_date = fmt_date(now_utc() - relativedelta(months=12))
+
+    current_year, current_month = to_year_month(current_date)
+    prev_year, prev_month = to_year_month(prev_year_date)
+
+    current_item = bls_latest_valid_before(series_id, current_year, current_month)
+    prev_year_item = bls_latest_valid_before(series_id, prev_year, prev_month)
+
+    current_value = current_item.get("value")
+    prev_year_value = prev_year_item.get("value")
+
+    if current_value is None or prev_year_value is None or prev_year_value == 0:
+        return {
+            "current": {"date": current_item.get("date"), "value": current_value},
+            "12m_ago": {"date": prev_year_item.get("date"), "value": prev_year_value},
+            "yoy_pct": None
+        }
+
+    yoy_pct = ((current_value / prev_year_value) - 1) * 100
+
+    return {
+        "current": {"date": current_item.get("date"), "value": current_value},
+        "12m_ago": {"date": prev_year_item.get("date"), "value": prev_year_value},
+        "yoy_pct": safe_round(yoy_pct)
+    }
+
+
 def build_curve_comparison(us10y_comp: dict, us2y_comp: dict):
     curve = {}
 
@@ -240,14 +273,54 @@ def build_curve_comparison(us10y_comp: dict, us2y_comp: dict):
     return curve
 
 
+def build_treasury_comparison():
+    comparison_dates = get_comparison_dates()
+
+    def build_field(field_name: str):
+        result = {}
+        for label, end_date in comparison_dates.items():
+            item = treasury_latest_mts_table_1_before(end_date)
+            result[label] = {
+                "date": item["date"],
+                "value": item[field_name]
+            }
+        result["changes"] = calculate_changes(result)
+        return result
+
+    return {
+        "fiscal_receipts": build_field("fiscal_receipts"),
+        "public_spending_proxy": build_field("public_spending_proxy"),
+        "deficit_proxy": build_field("deficit_proxy")
+    }
+
+
+def build_bls_comparison(series_id: str):
+    comparison_dates = get_comparison_dates()
+    result = {}
+
+    for label, end_date in comparison_dates.items():
+        year, month = to_year_month(end_date)
+        item = bls_latest_valid_before(series_id, year, month)
+        result[label] = {
+            "date": item["date"],
+            "value": item["value"]
+        }
+
+    result["changes"] = calculate_changes(result)
+    return result
+
+
 def build_empty_core_snapshot():
     return {
         "timestamp_utc": now_utc().isoformat(),
-        "fuentes": ["FRED"],
+        "fuentes": ["FRED", "TREASURY", "BLS"],
         "liquidez_global": {
             "fed_balance_walcl": None,
             "reverse_repo_rrpontsyd": None,
-            "tga_wtregen": None
+            "tga_wtregen": None,
+            "fiscal_receipts": None,
+            "public_spending_proxy": None,
+            "deficit_proxy": None
         },
         "inflacion": {
             "cpi": None,
@@ -302,6 +375,7 @@ def series_compare(series_key: str):
 def snapshot_core():
     snapshot = build_empty_core_snapshot()
 
+    # FRED
     for field, series_id in SERIES_MAP.items():
         item = fred_latest_before(series_id, fmt_date(now_utc()))
         value = item["value"]
@@ -322,9 +396,28 @@ def snapshot_core():
             f"{field}: ultimo dato disponible {date}" if date else f"{field}: sin dato disponible"
         )
 
-    snapshot["inflacion"]["cpi_yoy"] = yoy_from_series("CPIAUCSL")
+    # BLS CPI
+    current_year, current_month = to_year_month(fmt_date(now_utc()))
+    bls_cpi = bls_latest_valid_before("CUUR0000SA0", current_year, current_month)
+    if bls_cpi["value"] is not None:
+        snapshot["inflacion"]["cpi"] = bls_cpi["value"]
+        snapshot["notas_calidad"].append(f"cpi (BLS): ultimo dato disponible {bls_cpi['date']}")
+
+    # YoY
+    snapshot["inflacion"]["cpi_yoy"] = yoy_from_bls("CUUR0000SA0")
     snapshot["inflacion"]["pce_yoy"] = yoy_from_series("PCEPI")
 
+    # Treasury current
+    treasury_current = treasury_latest_mts_table_1_before(fmt_date(now_utc()))
+    snapshot["liquidez_global"]["fiscal_receipts"] = treasury_current["fiscal_receipts"]
+    snapshot["liquidez_global"]["public_spending_proxy"] = treasury_current["public_spending_proxy"]
+    snapshot["liquidez_global"]["deficit_proxy"] = treasury_current["deficit_proxy"]
+    if treasury_current["date"]:
+        snapshot["notas_calidad"].append(
+            f"treasury mts table 1: ultimo dato disponible {treasury_current['date']}"
+        )
+
+    # Curve
     us2y = snapshot["bonos"]["us2y"]
     us10y = snapshot["bonos"]["us10y"]
     if us2y is not None and us10y is not None:
@@ -337,6 +430,7 @@ def snapshot_core():
 def snapshot_core_compare():
     snapshot = build_empty_core_snapshot()
 
+    # FRED compare
     for field, series_id in SERIES_MAP.items():
         comparison_data = build_series_comparison(series_id)
 
@@ -356,16 +450,34 @@ def snapshot_core_compare():
             f"{field}: current usa dato {current_date}" if current_date else f"{field}: sin dato disponible"
         )
 
-    snapshot["inflacion"]["cpi_yoy"] = yoy_from_series("CPIAUCSL")
+    # BLS compare for CPI
+    snapshot["inflacion"]["cpi"] = build_bls_comparison("CUUR0000SA0")
+    snapshot["inflacion"]["cpi_yoy"] = yoy_from_bls("CUUR0000SA0")
+
+    # FRED compare for PCE YoY
     snapshot["inflacion"]["pce_yoy"] = yoy_from_series("PCEPI")
 
+    # Treasury compare
+    treasury_comp = build_treasury_comparison()
+    snapshot["liquidez_global"]["fiscal_receipts"] = treasury_comp["fiscal_receipts"]
+    snapshot["liquidez_global"]["public_spending_proxy"] = treasury_comp["public_spending_proxy"]
+    snapshot["liquidez_global"]["deficit_proxy"] = treasury_comp["deficit_proxy"]
+
+    treasury_current_date = treasury_comp["deficit_proxy"]["current"]["date"]
+    if treasury_current_date:
+        snapshot["notas_calidad"].append(
+            f"treasury mts table 1: current usa dato {treasury_current_date}"
+        )
+
+    # Curve compare
     snapshot["bonos"]["curve_2s10s"] = build_curve_comparison(
         snapshot["bonos"]["us10y"],
         snapshot["bonos"]["us2y"]
     )
-    
+
     return snapshot
-    
+
+
 @app.get("/test/treasury")
 def test_treasury():
     return treasury_get(
@@ -373,25 +485,16 @@ def test_treasury():
         {"page[size]": 1, "sort": "-record_date"}
     )
 
-def build_treasury_comparison():
-    comparison_dates = get_comparison_dates()
 
-    def build_field(field_name: str):
-        result = {}
-        for label, end_date in comparison_dates.items():
-            item = treasury_latest_mts_table_1_before(end_date)
-            result[label] = {
-                "date": item["date"],
-                "value": item[field_name]
-            }
-        result["changes"] = calculate_changes(result)
-        return result
+@app.get("/test/treasury_latest")
+def test_treasury_latest():
+    return treasury_latest_mts_table_1_before(fmt_date(now_utc()))
 
-    return {
-        "fiscal_receipts": build_field("fiscal_receipts"),
-        "public_spending_proxy": build_field("public_spending_proxy"),
-        "deficit_proxy": build_field("deficit_proxy")
-    }
+
+@app.get("/test/treasury_compare")
+def test_treasury_compare():
+    return build_treasury_comparison()
+
 
 @app.get("/test/bls")
 def test_bls():
@@ -400,3 +503,14 @@ def test_bls():
         start_year="2025",
         end_year="2026"
     )
+
+
+@app.get("/test/bls_latest_cpi")
+def test_bls_latest_cpi():
+    year, month = to_year_month(fmt_date(now_utc()))
+    return bls_latest_valid_before("CUUR0000SA0", year, month)
+
+
+@app.get("/test/bls_compare")
+def test_bls_compare():
+    return build_bls_comparison("CUUR0000SA0")
